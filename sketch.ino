@@ -1,0 +1,631 @@
+// Hospital Chemical Dosing IoT - Wokwi ESP32 Simulation
+// Components mirror the report flow:
+// external water gauge -> water valve + flow meter -> mixing chamber
+// chemical load-cell estimate -> PWM pump + flow meter -> mixing chamber
+// shared line -> sequential dispensing tank valves.
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// External, non-contact purified water level sensor.
+const int WATER_TRIG_PIN = 5;
+const int WATER_ECHO_PIN = 18;
+const int WATER_LEVEL_PIN = 39; // potentiometer represents external ultrasonic/level gauge for demo
+
+// External chemical tank estimate and flow feedback inputs.
+const int CHEM_WEIGHT_PIN = 34; // potentiometer represents external load-cell/HX711 output
+const int WATER_FLOW_PIN = 35;  // potentiometer represents water flow meter frequency
+const int CHEM_FLOW_PIN = 32;   // potentiometer represents chemical flow meter frequency
+
+// One low-level sensor per dispensing tank. Active LOW.
+const int TANK_LOW_PINS[] = {13, 12, 14};
+const int TANK_COUNT = 3;
+
+// Fault injection switches. Active LOW.
+const int LEAK_SWITCH_PIN = 33;
+const int BLOCK_SWITCH_PIN = 25;
+const int DRY_SWITCH_PIN = 36;
+
+// Actuators and indicators.
+const int WATER_VALVE_LED = 23;
+const int CHEM_PUMP_PWM_LED = 19;
+const int MIX_PUMP_LED = 26;
+const int TANK_VALVE_LEDS[] = {4, 16, 17};
+const int READY_LED = 2;
+const int ALARM_LED = 15;
+const int BUZZER_PIN = 27;
+
+// I2C LCD uses standard ESP32 I2C pins.
+const int LCD_SDA_PIN = 21;
+const int LCD_SCL_PIN = 22;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Physical assumptions from the report.
+// Wokwi HC-SR04 is easiest to adjust in a 0-400 cm range. The simulation
+// scales that measured height to the report's 2000 L purified-water tank.
+const float WATER_TANK_HEIGHT_CM = 400.0;
+const float WATER_TANK_CAPACITY_L = 2000.0;
+const float WATER_LOW_THRESHOLD_L = 200.0;
+const float CHEM_BOTTLE_FULL_ML = 10000.0;
+const float CHEM_LOW_THRESHOLD_ML = 800.0;
+const float CONCENTRATE_PPM = 100000.0;
+const float TARGET_PPM = 1000.0;
+const float TARGET_REFILL_ML = 500.0;
+const float WATER_TARGET_ML = TARGET_REFILL_ML * (1.0 - (TARGET_PPM / CONCENTRATE_PPM));
+const float CHEM_TARGET_ML = TARGET_REFILL_ML * (TARGET_PPM / CONCENTRATE_PPM);
+const unsigned long DISPENSE_TIMEOUT_MS = 30000;
+const unsigned long STATUS_PRINT_MS = 2000;
+const unsigned long LCD_REFRESH_MS = 750;
+const bool AUTO_DEMO_ENABLED = true;
+const unsigned long AUTO_DEMO_DELAY_MS = 5000;
+
+enum RunState {
+  IDLE,
+  DISPENSING,
+  ALARM
+};
+
+struct TankStats {
+  const char *name;
+  bool queued;
+  bool lastLow;
+  unsigned int refillCount;
+  float mixedDispensedML;
+  float chemicalUsedML;
+};
+
+TankStats tanks[TANK_COUNT] = {
+  {"Ward-A", false, false, 0, 0, 0},
+  {"ICU", false, false, 0, 0, 0},
+  {"Theatre", false, false, 0, 0, 0}
+};
+
+int refillQueue[12];
+int queueHead = 0;
+int queueTail = 0;
+int queueSize = 0;
+
+RunState state = IDLE;
+int activeTank = -1;
+unsigned long dispenseStartedAt = 0;
+unsigned long lastUpdateAt = 0;
+unsigned long lastStatusAt = 0;
+unsigned long lastLcdAt = 0;
+unsigned long lastWarningAt = 0;
+bool autoDemoQueued = false;
+float waterDosedML = 0;
+float chemDosedML = 0;
+float waterLevelL = 1800.0;
+float chemicalLoadCellML = CHEM_BOTTLE_FULL_ML;
+float chemicalFlowEstimateML = CHEM_BOTTLE_FULL_ML;
+float chemicalInitialEstimateML = CHEM_BOTTLE_FULL_ML;
+float totalChemicalUsedML = 0;
+bool simulatedLeak = false;
+bool simulatedBlockedValve = false;
+bool simulatedDrySupply = false;
+bool forcedWaterLow = false;
+bool forcedChemicalLow = false;
+String alarmMessage = "";
+
+float mapFloat(int raw, float outMin, float outMax) {
+  return outMin + (outMax - outMin) * ((float)raw / 4095.0);
+}
+
+bool switchActiveDigital(int pin) {
+  return digitalRead(pin) == LOW;
+}
+
+void setAllTankValvesLow() {
+  for (int i = 0; i < TANK_COUNT; i++) {
+    digitalWrite(TANK_VALVE_LEDS[i], LOW);
+  }
+}
+
+void setAlarm(const String &message) {
+  state = ALARM;
+  alarmMessage = message;
+  digitalWrite(ALARM_LED, HIGH);
+  digitalWrite(WATER_VALVE_LED, LOW);
+  analogWrite(CHEM_PUMP_PWM_LED, 0);
+  digitalWrite(MIX_PUMP_LED, LOW);
+  setAllTankValvesLow();
+  tone(BUZZER_PIN, 1800);
+  Serial.println();
+  Serial.println("[ALARM] " + message);
+}
+
+void clearAlarm() {
+  state = IDLE;
+  alarmMessage = "";
+  noTone(BUZZER_PIN);
+  digitalWrite(ALARM_LED, LOW);
+  Serial.println("[CTRL] Alarm cleared");
+}
+
+void enqueueTank(int tankIndex, const char *reason) {
+  if (tankIndex < 0 || tankIndex >= TANK_COUNT) return;
+  if (tanks[tankIndex].queued || tankIndex == activeTank) return;
+  if (queueSize >= 12) {
+    setAlarm("Queue full");
+    return;
+  }
+
+  refillQueue[queueTail] = tankIndex;
+  queueTail = (queueTail + 1) % 12;
+  queueSize++;
+  tanks[tankIndex].queued = true;
+
+  Serial.print("[QUEUE] Added ");
+  Serial.print(tanks[tankIndex].name);
+  Serial.print(" because ");
+  Serial.print(reason);
+  Serial.print(". Queue size=");
+  Serial.println(queueSize);
+}
+
+int dequeueTank() {
+  if (queueSize == 0) return -1;
+  int tankIndex = refillQueue[queueHead];
+  queueHead = (queueHead + 1) % 12;
+  queueSize--;
+  tanks[tankIndex].queued = false;
+  return tankIndex;
+}
+
+float readWaterLevelLitres() {
+  if (forcedWaterLow) return 120.0;
+
+  int raw = analogRead(WATER_LEVEL_PIN);
+  if (raw > 20) {
+    return mapFloat(raw, 0.0, WATER_TANK_CAPACITY_L);
+  }
+
+  digitalWrite(WATER_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(WATER_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(WATER_TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(WATER_ECHO_PIN, HIGH, 30000);
+  if (duration == 0) {
+    return waterLevelL;
+  }
+
+  float distanceCm = (duration * 0.0343) / 2.0;
+  float heightCm = WATER_TANK_HEIGHT_CM - distanceCm;
+  heightCm = constrain(heightCm, 0.0, WATER_TANK_HEIGHT_CM);
+  float litres = (heightCm / WATER_TANK_HEIGHT_CM) * WATER_TANK_CAPACITY_L;
+  return constrain(litres, 0.0, WATER_TANK_CAPACITY_L);
+}
+
+float readChemicalLoadCellML() {
+  if (forcedChemicalLow) return 350.0;
+  int raw = analogRead(CHEM_WEIGHT_PIN);
+  return mapFloat(raw, 0.0, CHEM_BOTTLE_FULL_ML);
+}
+
+float readWaterFlowMLPerSec() {
+  if (simulatedDrySupply) return 0.0;
+  int raw = analogRead(WATER_FLOW_PIN);
+  return mapFloat(raw, 0.0, 180.0); // faster demo flow for a 500 mL refill
+}
+
+float readChemicalFlowMLPerSec() {
+  int raw = analogRead(CHEM_FLOW_PIN);
+  return mapFloat(raw, 0.0, 18.0); // small pump flow feedback
+}
+
+void beginDispense(int tankIndex) {
+  activeTank = tankIndex;
+  state = DISPENSING;
+  waterDosedML = 0;
+  chemDosedML = 0;
+  dispenseStartedAt = millis();
+  lastUpdateAt = millis();
+
+  digitalWrite(READY_LED, LOW);
+  digitalWrite(WATER_VALVE_LED, HIGH);
+  analogWrite(CHEM_PUMP_PWM_LED, 185); // PWM command. Flow pot still controls actual measured flow.
+  digitalWrite(MIX_PUMP_LED, HIGH);
+  setAllTankValvesLow();
+  digitalWrite(TANK_VALVE_LEDS[tankIndex], HIGH);
+
+  Serial.println();
+  Serial.print("[CTRL] Starting refill for ");
+  Serial.print(tanks[tankIndex].name);
+  Serial.print(" target=");
+  Serial.print(TARGET_REFILL_ML, 1);
+  Serial.print("mL water=");
+  Serial.print(WATER_TARGET_ML, 1);
+  Serial.print("mL chemical=");
+  Serial.print(CHEM_TARGET_ML, 2);
+  Serial.println("mL");
+}
+
+void finishDispense() {
+  digitalWrite(WATER_VALVE_LED, LOW);
+  analogWrite(CHEM_PUMP_PWM_LED, 0);
+  digitalWrite(MIX_PUMP_LED, LOW);
+  setAllTankValvesLow();
+
+  tanks[activeTank].refillCount++;
+  tanks[activeTank].mixedDispensedML += waterDosedML + chemDosedML;
+  tanks[activeTank].chemicalUsedML += chemDosedML;
+
+  totalChemicalUsedML += chemDosedML;
+  chemicalFlowEstimateML = chemicalInitialEstimateML - totalChemicalUsedML;
+  if (chemicalFlowEstimateML < 0) chemicalFlowEstimateML = 0;
+
+  Serial.print("[DONE] ");
+  Serial.print(tanks[activeTank].name);
+  Serial.print(" received ");
+  Serial.print(waterDosedML + chemDosedML, 1);
+  Serial.print("mL mixed disinfectant, chemical=");
+  Serial.print(chemDosedML, 2);
+  Serial.println("mL");
+
+  activeTank = -1;
+  state = IDLE;
+  digitalWrite(READY_LED, HIGH);
+}
+
+void updateDispense() {
+  unsigned long now = millis();
+  float dt = (now - lastUpdateAt) / 1000.0;
+  lastUpdateAt = now;
+
+  if (simulatedBlockedValve) {
+    dt = 0;
+  }
+
+  float waterFlow = readWaterFlowMLPerSec();
+  float chemFlow = readChemicalFlowMLPerSec();
+
+  if (waterDosedML < WATER_TARGET_ML) {
+    waterDosedML += waterFlow * dt;
+  } else {
+    digitalWrite(WATER_VALVE_LED, LOW);
+  }
+
+  if (chemDosedML < CHEM_TARGET_ML) {
+    chemDosedML += chemFlow * dt;
+  } else {
+    analogWrite(CHEM_PUMP_PWM_LED, 0);
+  }
+
+  waterDosedML = min(waterDosedML, WATER_TARGET_ML);
+  chemDosedML = min(chemDosedML, CHEM_TARGET_ML);
+
+  if (waterFlow < 1.0 && waterDosedML < WATER_TARGET_ML && now - dispenseStartedAt > 3000) {
+    setAlarm("No water flow");
+    return;
+  }
+
+  if (chemFlow < 0.05 && chemDosedML < CHEM_TARGET_ML && now - dispenseStartedAt > 3000) {
+    setAlarm("No chem flow");
+    return;
+  }
+
+  if (simulatedBlockedValve && now - dispenseStartedAt > 3000) {
+    setAlarm("Blocked valve");
+    return;
+  }
+
+  if (now - dispenseStartedAt > DISPENSE_TIMEOUT_MS) {
+    setAlarm("Disp timeout");
+    return;
+  }
+
+  if (waterDosedML >= WATER_TARGET_ML && chemDosedML >= CHEM_TARGET_ML) {
+    finishDispense();
+  }
+}
+
+void scanTankLowSensors() {
+  for (int i = 0; i < TANK_COUNT; i++) {
+    bool lowNow = switchActiveDigital(TANK_LOW_PINS[i]);
+    if (lowNow && !tanks[i].lastLow) {
+      enqueueTank(i, "low-level switch");
+    }
+    tanks[i].lastLow = lowNow;
+  }
+}
+
+void printStatus() {
+  Serial.print("[STATUS] State=");
+  Serial.print(state == IDLE ? "IDLE" : state == DISPENSING ? "DISPENSING" : "ALARM");
+  Serial.print(" Water=");
+  Serial.print(waterLevelL, 0);
+  Serial.print("L ChemLoad=");
+  Serial.print(chemicalLoadCellML, 0);
+  Serial.print("mL ChemFlowEst=");
+  Serial.print(chemicalFlowEstimateML, 0);
+  Serial.print("mL Queue=");
+  Serial.print(queueSize);
+  if (activeTank >= 0) {
+    Serial.print(" Active=");
+    Serial.print(tanks[activeTank].name);
+    Serial.print(" W=");
+    Serial.print(waterDosedML, 1);
+    Serial.print("/");
+    Serial.print(WATER_TARGET_ML, 1);
+    Serial.print(" C=");
+    Serial.print(chemDosedML, 2);
+    Serial.print("/");
+    Serial.print(CHEM_TARGET_ML, 2);
+  }
+  Serial.println();
+}
+
+void printReport() {
+  Serial.println();
+  Serial.println("========== PERIODIC DISPENSING REPORT ==========");
+  Serial.println("Location, Refills, Mixed mL, Chemical mL");
+  for (int i = 0; i < TANK_COUNT; i++) {
+    Serial.print(tanks[i].name);
+    Serial.print(", ");
+    Serial.print(tanks[i].refillCount);
+    Serial.print(", ");
+    Serial.print(tanks[i].mixedDispensedML, 1);
+    Serial.print(", ");
+    Serial.println(tanks[i].chemicalUsedML, 2);
+  }
+  Serial.print("Total chemical used: ");
+  Serial.print(totalChemicalUsedML, 2);
+  Serial.println(" mL");
+  Serial.println("===============================================");
+  Serial.println();
+}
+
+void showHelp() {
+  Serial.println();
+  Serial.println("Wokwi test commands:");
+  Serial.println("  low1 / low2 / low3  - enqueue one dispensing tank");
+  Serial.println("  all                 - enqueue all tanks FIFO");
+  Serial.println("  waterlow            - force purified-water low warning/precheck");
+  Serial.println("  chemlow             - force concentrated-chemical low warning/precheck");
+  Serial.println("  leak                - force pipeline/container leak alarm");
+  Serial.println("  block               - force blocked valve condition");
+  Serial.println("  dry                 - force dry water supply condition");
+  Serial.println("  newchem             - recalibrate chemical container estimate");
+  Serial.println("  clearfaults         - clear injected faults");
+  Serial.println("  reset               - clear alarm and queues");
+  Serial.println("  status              - print current telemetry");
+  Serial.println("  report              - print usage report");
+  Serial.println();
+  Serial.println("Auto-demo is enabled: tanks will queue automatically after startup.");
+  Serial.println();
+}
+
+void resetQueue() {
+  queueHead = 0;
+  queueTail = 0;
+  queueSize = 0;
+  for (int i = 0; i < TANK_COUNT; i++) {
+    tanks[i].queued = false;
+  }
+}
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+  if (cmd.length() == 0) return;
+
+  if (cmd == "help") showHelp();
+  else if (cmd == "low1") enqueueTank(0, "serial test");
+  else if (cmd == "low2") enqueueTank(1, "serial test");
+  else if (cmd == "low3") enqueueTank(2, "serial test");
+  else if (cmd == "all") {
+    enqueueTank(0, "serial FIFO test");
+    enqueueTank(1, "serial FIFO test");
+    enqueueTank(2, "serial FIFO test");
+  } else if (cmd == "waterlow") {
+    forcedWaterLow = true;
+    Serial.println("[TEST] Water low condition forced");
+  } else if (cmd == "chemlow") {
+    forcedChemicalLow = true;
+    Serial.println("[TEST] Chemical low condition forced");
+  } else if (cmd == "leak") {
+    simulatedLeak = true;
+    setAlarm("Leak detected");
+  } else if (cmd == "block") {
+    simulatedBlockedValve = true;
+    Serial.println("[TEST] Blocked valve fault armed");
+  } else if (cmd == "dry") {
+    simulatedDrySupply = true;
+    Serial.println("[TEST] Dry supply fault armed");
+  } else if (cmd == "newchem") {
+    chemicalInitialEstimateML = chemicalLoadCellML;
+    chemicalFlowEstimateML = chemicalInitialEstimateML - totalChemicalUsedML;
+    if (chemicalFlowEstimateML < 0) chemicalFlowEstimateML = 0;
+    Serial.print("[TEST] Chemical estimate recalibrated to ");
+    Serial.print(chemicalInitialEstimateML, 0);
+    Serial.println(" mL");
+  } else if (cmd == "clearfaults") {
+    simulatedLeak = false;
+    simulatedBlockedValve = false;
+    simulatedDrySupply = false;
+    forcedWaterLow = false;
+    forcedChemicalLow = false;
+    Serial.println("[TEST] Fault injections cleared");
+  } else if (cmd == "reset") {
+    resetQueue();
+    simulatedLeak = false;
+    simulatedBlockedValve = false;
+    simulatedDrySupply = false;
+    forcedWaterLow = false;
+    forcedChemicalLow = false;
+    clearAlarm();
+    activeTank = -1;
+    digitalWrite(WATER_VALVE_LED, LOW);
+    analogWrite(CHEM_PUMP_PWM_LED, 0);
+    digitalWrite(MIX_PUMP_LED, LOW);
+    setAllTankValvesLow();
+  } else if (cmd == "status") printStatus();
+  else if (cmd == "report") printReport();
+  else Serial.println("[WARN] Unknown command. Type help.");
+}
+
+void updateLcd() {
+  unsigned long now = millis();
+  if (now - lastLcdAt < LCD_REFRESH_MS) return;
+  lastLcdAt = now;
+
+  lcd.clear();
+  if (state == ALARM) {
+    lcd.setCursor(0, 0);
+    lcd.print("ALARM");
+    lcd.setCursor(0, 1);
+    lcd.print(alarmMessage.substring(0, 16));
+    return;
+  }
+
+  lcd.setCursor(0, 0);
+  lcd.print("W:");
+  lcd.print((int)waterLevelL);
+  lcd.print("L C:");
+  lcd.print((int)(chemicalLoadCellML / 1000.0));
+  lcd.print("L");
+
+  lcd.setCursor(0, 1);
+  if (state == DISPENSING && activeTank >= 0) {
+    lcd.print(tanks[activeTank].name);
+    lcd.print(" ");
+    lcd.print((int)(waterDosedML + chemDosedML));
+    lcd.print("/");
+    lcd.print((int)TARGET_REFILL_ML);
+  } else {
+    lcd.print("Ready Q:");
+    lcd.print(queueSize);
+    lcd.print(" PPM:");
+    lcd.print((int)TARGET_PPM);
+  }
+}
+
+void runPreChecksAndStartNext() {
+  if (state != IDLE || queueSize == 0) return;
+
+  if (waterLevelL < WATER_LOW_THRESHOLD_L) {
+    setAlarm("Water low");
+    return;
+  }
+
+  if (chemicalLoadCellML < CHEM_LOW_THRESHOLD_ML || chemicalFlowEstimateML < CHEM_TARGET_ML) {
+    setAlarm("Chemical low");
+    return;
+  }
+
+  if (simulatedLeak || switchActiveDigital(LEAK_SWITCH_PIN)) {
+    setAlarm("Leak detected");
+    return;
+  }
+
+  int nextTank = dequeueTank();
+  beginDispense(nextTank);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(WATER_TRIG_PIN, OUTPUT);
+  pinMode(WATER_ECHO_PIN, INPUT);
+  pinMode(WATER_LEVEL_PIN, INPUT);
+  pinMode(CHEM_WEIGHT_PIN, INPUT);
+  pinMode(WATER_FLOW_PIN, INPUT);
+  pinMode(CHEM_FLOW_PIN, INPUT);
+  pinMode(LEAK_SWITCH_PIN, INPUT);
+  pinMode(BLOCK_SWITCH_PIN, INPUT);
+  pinMode(DRY_SWITCH_PIN, INPUT);
+
+  for (int i = 0; i < TANK_COUNT; i++) {
+    pinMode(TANK_LOW_PINS[i], INPUT);
+    pinMode(TANK_VALVE_LEDS[i], OUTPUT);
+  }
+
+  pinMode(WATER_VALVE_LED, OUTPUT);
+  pinMode(CHEM_PUMP_PWM_LED, OUTPUT);
+  pinMode(MIX_PUMP_LED, OUTPUT);
+  pinMode(READY_LED, OUTPUT);
+  pinMode(ALARM_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN);
+  lcd.init();
+  lcd.begin(16, 2);
+  lcd.display();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Hospital Dosing");
+  lcd.setCursor(0, 1);
+  lcd.print("Auto demo ready");
+
+  digitalWrite(READY_LED, HIGH);
+  digitalWrite(ALARM_LED, LOW);
+  digitalWrite(WATER_VALVE_LED, LOW);
+  digitalWrite(MIX_PUMP_LED, LOW);
+  analogWrite(CHEM_PUMP_PWM_LED, 0);
+  setAllTankValvesLow();
+  noTone(BUZZER_PIN);
+
+  chemicalLoadCellML = readChemicalLoadCellML();
+  chemicalInitialEstimateML = CHEM_BOTTLE_FULL_ML;
+  chemicalFlowEstimateML = chemicalInitialEstimateML;
+
+  Serial.println();
+  Serial.println("Hospital Chemical Dosing IoT simulation ready.");
+  Serial.println("Auto-demo enabled: a FIFO refill sequence will start automatically.");
+  Serial.println("Type help in the Serial Monitor for separate tests.");
+  showHelp();
+}
+
+void loop() {
+  handleSerial();
+
+  waterLevelL = readWaterLevelLitres();
+  chemicalLoadCellML = readChemicalLoadCellML();
+  simulatedLeak = simulatedLeak || switchActiveDigital(LEAK_SWITCH_PIN);
+  simulatedBlockedValve = simulatedBlockedValve || switchActiveDigital(BLOCK_SWITCH_PIN);
+  simulatedDrySupply = simulatedDrySupply || (digitalRead(DRY_SWITCH_PIN) == HIGH);
+
+  if (state != ALARM && millis() - lastWarningAt > 3000) {
+    lastWarningAt = millis();
+    if (chemicalLoadCellML < CHEM_LOW_THRESHOLD_ML) {
+      Serial.println("[WARN] Chemical container below threshold");
+    }
+
+    if (waterLevelL < WATER_LOW_THRESHOLD_L) {
+      Serial.println("[WARN] Purified water below threshold");
+    }
+
+    float difference = abs(chemicalLoadCellML - chemicalFlowEstimateML);
+    if (!forcedChemicalLow && difference > CHEM_BOTTLE_FULL_ML * 0.10) {
+      Serial.println("[WARN] Chemical load/flow estimate mismatch");
+    }
+  }
+
+  if (state == IDLE) {
+    if (AUTO_DEMO_ENABLED && !autoDemoQueued && millis() > AUTO_DEMO_DELAY_MS) {
+      autoDemoQueued = true;
+      Serial.println("[DEMO] Auto-queueing Ward-A, ICU, and Theatre.");
+      enqueueTank(0, "auto demo");
+      enqueueTank(1, "auto demo");
+      enqueueTank(2, "auto demo");
+    }
+    scanTankLowSensors();
+    runPreChecksAndStartNext();
+  } else if (state == DISPENSING) {
+    updateDispense();
+  }
+
+  if (millis() - lastStatusAt > STATUS_PRINT_MS) {
+    lastStatusAt = millis();
+    printStatus();
+  }
+
+  updateLcd();
+  delay(20);
+}
